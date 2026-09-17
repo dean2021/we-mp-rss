@@ -191,7 +191,7 @@ async def get_mp_articles_source(
     offset: int = Query(0, ge=0),
     kw:str="",
     is_update:bool=True,
-    content_type:str=Query(None,alias="ctype"),
+    content_type:str=Query(None,alias="ctype")
     # current_user: dict = Depends(get_current_user)
 ):
     limit = clamp_rss_limit(limit)
