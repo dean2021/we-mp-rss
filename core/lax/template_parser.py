@@ -1,5 +1,6 @@
 import re
 import os
+import ast
 from typing import Any, Dict, List, Union
 # """
 # 模板引擎使用示例
@@ -855,7 +856,13 @@ class TemplateParser:
         return safe_builtins
 
     def _is_safe_expression(self, expr: str) -> bool:
-        """Check if an expression contains potentially dangerous operations."""
+        """Check if an expression contains potentially dangerous operations.
+
+        .. deprecated::
+            Kept for backwards compatibility. Actual enforcement is performed by
+            :meth:`_validate_ast_node`, which allow-lists the AST nodes, names
+            and attributes an expression may use.
+        """
         forbidden = [
             'import', 'open', 'exec', 'eval', 'system', 'subprocess',
             '__import__', 'getattr', 'setattr', 'delattr', 'compile',
@@ -864,6 +871,185 @@ class TemplateParser:
         ]
         expr_lower = expr.lower()
         return not any(keyword in expr_lower for keyword in forbidden)
+
+    # AST operators that template expressions are allowed to use.
+    _ALLOWED_BIN_OPS = (
+        ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow,
+    )
+    _ALLOWED_UNARY_OPS = (ast.UAdd, ast.USub, ast.Not)
+    _ALLOWED_BOOL_OPS = (ast.And, ast.Or)
+    _ALLOWED_CMP_OPS = (
+        ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+        ast.In, ast.NotIn, ast.Is, ast.IsNot,
+    )
+
+    def _validate_ast_node(self, node: ast.AST, allowed_names: set) -> None:
+        """Recursively validate an expression AST against a strict allow-list.
+
+        Only a small, safe subset of Python expressions is permitted. Private
+        attributes (``__class__`` and friends) and calls to anything other than
+        an explicitly allowed plain function name are rejected, which prevents
+        sandbox escapes such as ``().__class__.__bases__`` or
+        ``__builtins__['__impo'+'rt__']``.
+        """
+        if isinstance(node, ast.Expression):
+            self._validate_ast_node(node.body, allowed_names)
+            return
+        if isinstance(node, ast.Constant):
+            return
+        # Python < 3.8 compatibility for literals.
+        literal_types = tuple(
+            t for t in (getattr(ast, 'Num', None), getattr(ast, 'Str', None),
+                        getattr(ast, 'Bytes', None), getattr(ast, 'NameConstant', None))
+            if t is not None
+        )
+        if literal_types and isinstance(node, literal_types):
+            return
+        if isinstance(node, ast.Name):
+            if node.id not in allowed_names:
+                raise ValueError(f"Disallowed name in expression: {node.id}")
+            return
+        if isinstance(node, ast.BinOp):
+            if not isinstance(node.op, self._ALLOWED_BIN_OPS):
+                raise ValueError(f"Disallowed binary operator: {type(node.op).__name__}")
+            self._validate_ast_node(node.left, allowed_names)
+            self._validate_ast_node(node.right, allowed_names)
+            return
+        if isinstance(node, ast.UnaryOp):
+            if not isinstance(node.op, self._ALLOWED_UNARY_OPS):
+                raise ValueError(f"Disallowed unary operator: {type(node.op).__name__}")
+            self._validate_ast_node(node.operand, allowed_names)
+            return
+        if isinstance(node, ast.BoolOp):
+            if not isinstance(node.op, self._ALLOWED_BOOL_OPS):
+                raise ValueError(f"Disallowed boolean operator: {type(node.op).__name__}")
+            for value in node.values:
+                self._validate_ast_node(value, allowed_names)
+            return
+        if isinstance(node, ast.Compare):
+            for op in node.ops:
+                if not isinstance(op, self._ALLOWED_CMP_OPS):
+                    raise ValueError(f"Disallowed comparison operator: {type(op).__name__}")
+            self._validate_ast_node(node.left, allowed_names)
+            for comparator in node.comparators:
+                self._validate_ast_node(comparator, allowed_names)
+            return
+        if isinstance(node, ast.Attribute):
+            if not isinstance(node.attr, str) or node.attr.startswith('_'):
+                raise ValueError(f"Access to private attribute is not allowed: {node.attr}")
+            self._validate_ast_node(node.value, allowed_names)
+            return
+        if isinstance(node, ast.Subscript):
+            self._validate_ast_node(node.value, allowed_names)
+            self._validate_ast_node(node.slice, allowed_names)
+            return
+        if isinstance(node, ast.Slice):
+            for part in (node.lower, node.upper, node.step):
+                if part is not None:
+                    self._validate_ast_node(part, allowed_names)
+            return
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            for element in node.elts:
+                if isinstance(element, ast.Starred):
+                    raise ValueError("Starred elements are not allowed")
+                self._validate_ast_node(element, allowed_names)
+            return
+        if isinstance(node, ast.Dict):
+            for key in node.keys:
+                if key is not None:
+                    self._validate_ast_node(key, allowed_names)
+            for value in node.values:
+                self._validate_ast_node(value, allowed_names)
+            return
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name):
+                raise ValueError("Only direct calls to allowed functions are permitted")
+            if node.func.id not in allowed_names:
+                raise ValueError(f"Call to disallowed function: {node.func.id}")
+            for arg in node.args:
+                if isinstance(arg, ast.Starred):
+                    raise ValueError("Starred arguments are not allowed")
+                self._validate_ast_node(arg, allowed_names)
+            for keyword in node.keywords:
+                if keyword.arg is None:
+                    raise ValueError("Keyword argument unpacking is not allowed")
+                self._validate_ast_node(keyword.value, allowed_names)
+            return
+        if isinstance(node, ast.IfExp):
+            self._validate_ast_node(node.test, allowed_names)
+            self._validate_ast_node(node.body, allowed_names)
+            self._validate_ast_node(node.orelse, allowed_names)
+            return
+        index_type = getattr(ast, 'Index', None)
+        if index_type is not None and isinstance(node, index_type):
+            self._validate_ast_node(node.value, allowed_names)
+            return
+        raise ValueError(f"Disallowed expression element: {type(node).__name__}")
+
+    def _safe_eval(self, expr: str, eval_globals: Dict[str, Any],
+                   local_vars: Dict[str, Any]) -> Any:
+        """Validate and evaluate an expression without exposing real builtins.
+
+        Unlike a substring blocklist, this parses the expression and only
+        permits allow-listed AST nodes, names and non-private attributes. An
+        explicit empty ``__builtins__`` is supplied so the interpreter can never
+        fall back to the genuine builtins module.
+        """
+        tree = ast.parse(expr, mode='eval')
+        allowed_names = set(eval_globals.keys()) | set(local_vars.keys())
+        self._validate_ast_node(tree, allowed_names)
+        safe_globals = dict(eval_globals)
+        safe_globals['__builtins__'] = {}
+        return eval(compile(tree, '<template>', 'eval'), safe_globals, local_vars)
+
+    def _validate_statement_node(self, node: ast.AST, allowed_names: set) -> None:
+        """Validate a statement used inside a multi-line code block."""
+        if isinstance(node, ast.Module):
+            for stmt in node.body:
+                self._validate_statement_node(stmt, allowed_names)
+            return
+        if isinstance(node, ast.Expr):
+            self._validate_ast_node(node.value, allowed_names)
+            return
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if not isinstance(target, ast.Name):
+                    raise ValueError("Only simple variable assignment is allowed")
+            self._validate_ast_node(node.value, allowed_names)
+            return
+        if isinstance(node, ast.AnnAssign):
+            if not isinstance(node.target, ast.Name):
+                raise ValueError("Only simple variable assignment is allowed")
+            if node.value is not None:
+                self._validate_ast_node(node.value, allowed_names)
+            return
+        if isinstance(node, ast.AugAssign):
+            if not isinstance(node.target, ast.Name):
+                raise ValueError("Only simple variable assignment is allowed")
+            if not isinstance(node.op, self._ALLOWED_BIN_OPS):
+                raise ValueError(f"Disallowed binary operator: {type(node.op).__name__}")
+            self._validate_ast_node(node.value, allowed_names)
+            return
+        if isinstance(node, ast.If):
+            self._validate_ast_node(node.test, allowed_names)
+            for stmt in node.body:
+                self._validate_statement_node(stmt, allowed_names)
+            for stmt in node.orelse:
+                self._validate_statement_node(stmt, allowed_names)
+            return
+        if isinstance(node, ast.Pass):
+            return
+        raise ValueError(f"Disallowed statement: {type(node).__name__}")
+
+    def _safe_exec(self, code: str, eval_globals: Dict[str, Any],
+                   local_vars: Dict[str, Any]) -> None:
+        """Validate and execute a multi-line code block without real builtins."""
+        tree = ast.parse(code, mode='exec')
+        allowed_names = set(eval_globals.keys()) | set(local_vars.keys())
+        self._validate_statement_node(tree, allowed_names)
+        safe_globals = dict(eval_globals)
+        safe_globals['__builtins__'] = {}
+        exec(compile(tree, '<string>', 'exec'), safe_globals, local_vars)
 
     def _evaluate_condition(self, condition: str, context: Dict[str, Any]) -> tuple:
         """
@@ -908,8 +1094,7 @@ class TemplateParser:
             # Handle multi-line code blocks
             if '\n' in condition.strip():
                 # Compile and execute the code block in restricted environment
-                code = compile(condition, '<string>', 'exec')
-                exec(code, eval_globals, local_vars)
+                self._safe_exec(condition, eval_globals, local_vars)
                 # The last expression's value should be in __result__
                 result = bool(local_vars.get('__result__', False))
                 # Return result and updated context (excluding special vars)
@@ -932,7 +1117,7 @@ class TemplateParser:
             
             # Handle function calls with = prefix
             if condition.startswith('='):
-                result = bool(eval(condition[1:], eval_globals, local_vars))
+                result = bool(self._safe_eval(condition[1:], eval_globals, local_vars))
                 return result, local_vars
             
             # Handle nested attribute access (e.g. user.is_admin)
@@ -959,7 +1144,7 @@ class TemplateParser:
                 return bool(value), local_vars
                 
             # Evaluate other expressions
-            result = bool(eval(condition, eval_globals, local_vars))
+            result = bool(self._safe_eval(condition, eval_globals, local_vars))
             return result, local_vars
             
         except Exception:
@@ -1030,7 +1215,7 @@ class TemplateParser:
                 raise ValueError("Potentially dangerous expression detected")
             
             safe_globals = self._get_safe_globals()
-            return eval(iterable, safe_globals, context)
+            return self._safe_eval(iterable, safe_globals, context)
         except Exception:
             return []
             
@@ -1100,7 +1285,7 @@ class TemplateParser:
                     })
                     eval_globals = {**safe_globals, **self.custom_functions}
                     
-                    value = eval(value_expr, eval_globals, context)
+                    value = self._safe_eval(value_expr, eval_globals, context)
                     
                     # Store in context for future use
                     context[var_name] = value
@@ -1134,7 +1319,7 @@ class TemplateParser:
                     })
                     eval_globals = {**safe_globals, **self.custom_functions}
                     
-                    value = eval(value_expr, eval_globals, context)
+                    value = self._safe_eval(value_expr, eval_globals, context)
                     
                     # Create a new context with the local variable
                     # In let expressions, the variable is available within the current evaluation scope
@@ -1161,7 +1346,7 @@ class TemplateParser:
         eval_globals = {**safe_globals, **self.custom_functions}
         
         try:
-            return eval(expr, eval_globals, context)
+            return self._safe_eval(expr, eval_globals, context)
         except Exception as e:
             return f"[Calculation Error: {str(e)}]"
 
