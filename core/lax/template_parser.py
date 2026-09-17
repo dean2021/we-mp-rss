@@ -1,6 +1,7 @@
 import ast
 import re
 import os
+import ast
 from typing import Any, Dict, List, Union
 
 # AST node allowlists used by the safe evaluator. Only expressions built from
@@ -925,7 +926,13 @@ class TemplateParser:
         return safe_builtins
 
     def _is_safe_expression(self, expr: str) -> bool:
-        """Check if an expression contains potentially dangerous operations."""
+        """Check if an expression contains potentially dangerous operations.
+
+        .. deprecated::
+            Kept for backwards compatibility. Actual enforcement is performed by
+            :meth:`_validate_ast_node`, which allow-lists the AST nodes, names
+            and attributes an expression may use.
+        """
         forbidden = [
             'import', 'open', 'exec', 'eval', 'system', 'subprocess',
             '__import__', 'getattr', 'setattr', 'delattr', 'compile',
