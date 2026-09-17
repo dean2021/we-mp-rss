@@ -191,8 +191,7 @@ async def get_mp_articles_source(
     offset: int = Query(0, ge=0),
     kw:str="",
     is_update:bool=True,
-    content_type:str=Query(None,alias="ctype"),
-    template:str=None
+    content_type:str=Query(None,alias="ctype")
     # current_user: dict = Depends(get_current_user)
 ):
     limit = clamp_rss_limit(limit)
@@ -288,7 +287,7 @@ async def get_mp_articles_source(
             }
             rss.cache_content(article.id, content_data)
         # 生成RSS XML
-        rss_xml = rss.generate(rss_list,ext=ext, title=f"{feed.mp_name}",link=feed_link,description=feed.mp_intro,image_url=feed.mp_cover,template=template)
+        rss_xml = rss.generate(rss_list,ext=ext, title=f"{feed.mp_name}",link=feed_link,description=feed.mp_intro,image_url=feed.mp_cover)
         
         return Response(
             content=rss_xml,

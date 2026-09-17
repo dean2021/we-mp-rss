@@ -314,9 +314,30 @@ class RSS:
         else:
             raise ValueError(f"Unsupported extension: {ext}")
     def generate_by_template(self,rss_list: dict, template: str, title: str = "Mp-We-Rss",link: str = "https://github.com/rachelos/we-mp-rss",description: str = "RSS频道",language: str = "zh-CN",image_url:str=""):
+            """Render RSS using a template file from the trusted templates directory.
+
+            ``template`` is interpreted as a file name relative to
+            ``public/templates/`` (see ``views.config.base.public_dir``) rather
+            than raw template source. This prevents callers from injecting
+            arbitrary template content.
+            """
             from core.lax import TemplateParser
-            template = TemplateParser(template)
-            return template.render({"articles": rss_list, "title": title,"link":link,"description":description,"language":language,"image_url":image_url})
+            from views.config import base
+
+            if not template:
+                raise ValueError("Template name is required")
+
+            base_dir = os.path.normpath(os.path.abspath(base.public_dir))
+            # Reject absolute paths before joining to avoid escaping the base dir.
+            candidate = os.path.normpath(os.path.join(base_dir, template.lstrip('/\\')))
+            if candidate != base_dir and not candidate.startswith(base_dir + os.sep):
+                raise ValueError("Invalid template path: Path traversal detected.")
+
+            with open(candidate, 'r', encoding='utf-8') as f:
+                template_content = f.read()
+
+            parser = TemplateParser(template_content, template_dir=base.public_dir)
+            return parser.render({"articles": rss_list, "title": title,"link":link,"description":description,"language":language,"image_url":image_url})
             pass
     def clear_cache(self,mp_id:str=""):
 

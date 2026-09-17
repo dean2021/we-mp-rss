@@ -1,6 +1,76 @@
+import ast
 import re
 import os
 from typing import Any, Dict, List, Union
+
+# AST node allowlists used by the safe evaluator. Only expressions built from
+# these nodes are accepted; imports, lambdas, comprehensions, dunder access and
+# calls to non-whitelisted functions are rejected. This is the real security
+# boundary for `{{= ... }}`, `{% if ... %}`, `{% for ... in ... %}` and set/let
+# expressions, and it cannot be bypassed by splitting forbidden words.
+_ALLOWED_EXPR_NODES = (
+    ast.Expression,
+    ast.Constant,
+    ast.Name,
+    ast.Load,
+    ast.Store,
+    ast.Del,
+    ast.Attribute,
+    ast.Subscript,
+    ast.Slice,
+    ast.Tuple,
+    ast.List,
+    ast.Dict,
+    ast.Set,
+    ast.BinOp,
+    ast.UnaryOp,
+    ast.BoolOp,
+    ast.Compare,
+    ast.IfExp,
+    ast.Call,
+    ast.keyword,
+    ast.Starred,
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.FloorDiv,
+    ast.Mod,
+    ast.Pow,
+    ast.USub,
+    ast.UAdd,
+    ast.Not,
+    ast.Invert,
+    ast.And,
+    ast.Or,
+    ast.Eq,
+    ast.NotEq,
+    ast.Lt,
+    ast.LtE,
+    ast.Gt,
+    ast.GtE,
+    ast.In,
+    ast.NotIn,
+    ast.Is,
+    ast.IsNot,
+    ast.BitAnd,
+    ast.BitOr,
+    ast.BitXor,
+    ast.LShift,
+    ast.RShift,
+)
+if hasattr(ast, 'Index'):  # Python 3.8 compatibility
+    _ALLOWED_EXPR_NODES = _ALLOWED_EXPR_NODES + (ast.Index,)
+
+# Restricted set of statements allowed inside multi-line `{% if ... %}` blocks.
+_ALLOWED_STMT_NODES = (
+    ast.Module,
+    ast.Assign,
+    ast.AugAssign,
+    ast.AnnAssign,
+    ast.Expr,
+    ast.Pass,
+)
 # """
 # 模板引擎使用示例
 
@@ -865,6 +935,60 @@ class TemplateParser:
         expr_lower = expr.lower()
         return not any(keyword in expr_lower for keyword in forbidden)
 
+    def _validate_ast(self, source: str, mode: str, allowed_calls: set):
+        """Parse ``source`` and reject anything outside the node allowlist.
+
+        This is the security boundary for evaluation: it prevents imports,
+        dunder access, lambdas, comprehensions and calls to functions that are
+        not explicitly whitelisted, no matter how the text is split.
+        """
+        try:
+            tree = ast.parse(source, mode=mode)
+        except SyntaxError as e:
+            raise ValueError(f"Invalid expression syntax: {e}")
+
+        allowed = _ALLOWED_EXPR_NODES if mode == 'eval' else _ALLOWED_EXPR_NODES + _ALLOWED_STMT_NODES
+        for node in ast.walk(tree):
+            if not isinstance(node, allowed):
+                raise ValueError(f"Disallowed expression element: {type(node).__name__}")
+            if isinstance(node, ast.Name) and node.id.startswith('_'):
+                raise ValueError("Access to private names is not allowed")
+            if isinstance(node, ast.Attribute) and node.attr.startswith('_'):
+                raise ValueError("Access to private attributes is not allowed")
+            if isinstance(node, ast.Call):
+                if not isinstance(node.func, ast.Name):
+                    raise ValueError("Only direct calls to whitelisted functions are allowed")
+                if node.func.id.startswith('_'):
+                    raise ValueError("Access to private names is not allowed")
+                if node.func.id not in allowed_calls:
+                    raise ValueError(f"Call to unknown function: {node.func.id}")
+        return tree
+
+    def _build_safe_namespace(self, extra_globals: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Build an evaluation namespace with no real builtins."""
+        namespace: Dict[str, Any] = {}
+        namespace.update(self._get_safe_globals())
+        if extra_globals:
+            namespace.update(extra_globals)
+        namespace.update(self.custom_functions)
+        # Set last so a custom function can never replace the restricted builtins.
+        namespace['__builtins__'] = {}
+        return namespace
+
+    def _safe_eval(self, expr: str, context: Dict[str, Any], extra_globals: Dict[str, Any] = None) -> Any:
+        """Evaluate ``expr`` in a validated namespace without interpreter builtins."""
+        namespace = self._build_safe_namespace(extra_globals)
+        tree = self._validate_ast(expr, 'eval', set(namespace.keys()))
+        return eval(compile(tree, '<template>', 'eval'), namespace, context)
+
+    def _safe_exec(self, source: str, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a restricted multi-line code block and return the locals."""
+        namespace = self._build_safe_namespace()
+        tree = self._validate_ast(source, 'exec', set(namespace.keys()))
+        local_vars = dict(context)
+        exec(compile(tree, '<template>', 'exec'), namespace, local_vars)
+        return local_vars
+
     def _evaluate_condition(self, condition: str, context: Dict[str, Any]) -> tuple:
         """
         Evaluate a condition expression or code block in the given context.
@@ -898,18 +1022,13 @@ class TemplateParser:
                 # Invert result if 'not' was present
                 return (not result if has_not else result), context
                     
-            # Create safe evaluation environment
-            safe_globals = self._get_safe_globals()
-            eval_globals = {**safe_globals, **self.custom_functions}
-            
             # Make a copy of context to avoid modifying the original
             local_vars = context.copy()
             
             # Handle multi-line code blocks
             if '\n' in condition.strip():
-                # Compile and execute the code block in restricted environment
-                code = compile(condition, '<string>', 'exec')
-                exec(code, eval_globals, local_vars)
+                # Execute the code block in the restricted evaluator
+                local_vars = self._safe_exec(condition, local_vars)
                 # The last expression's value should be in __result__
                 result = bool(local_vars.get('__result__', False))
                 # Return result and updated context (excluding special vars)
@@ -932,7 +1051,7 @@ class TemplateParser:
             
             # Handle function calls with = prefix
             if condition.startswith('='):
-                result = bool(eval(condition[1:], eval_globals, local_vars))
+                result = bool(self._safe_eval(condition[1:], local_vars))
                 return result, local_vars
             
             # Handle nested attribute access (e.g. user.is_admin)
@@ -959,7 +1078,7 @@ class TemplateParser:
                 return bool(value), local_vars
                 
             # Evaluate other expressions
-            result = bool(eval(condition, eval_globals, local_vars))
+            result = bool(self._safe_eval(condition, local_vars))
             return result, local_vars
             
         except Exception:
@@ -1029,8 +1148,7 @@ class TemplateParser:
             if not self._is_safe_expression(iterable):
                 raise ValueError("Potentially dangerous expression detected")
             
-            safe_globals = self._get_safe_globals()
-            return eval(iterable, safe_globals, context)
+            return self._safe_eval(iterable, context)
         except Exception:
             return []
             
@@ -1100,7 +1218,7 @@ class TemplateParser:
                     })
                     eval_globals = {**safe_globals, **self.custom_functions}
                     
-                    value = eval(value_expr, eval_globals, context)
+                    value = self._safe_eval(value_expr, context)
                     
                     # Store in context for future use
                     context[var_name] = value
@@ -1134,7 +1252,7 @@ class TemplateParser:
                     })
                     eval_globals = {**safe_globals, **self.custom_functions}
                     
-                    value = eval(value_expr, eval_globals, context)
+                    value = self._safe_eval(value_expr, context)
                     
                     # Create a new context with the local variable
                     # In let expressions, the variable is available within the current evaluation scope
@@ -1161,7 +1279,7 @@ class TemplateParser:
         eval_globals = {**safe_globals, **self.custom_functions}
         
         try:
-            return eval(expr, eval_globals, context)
+            return self._safe_eval(expr, context)
         except Exception as e:
             return f"[Calculation Error: {str(e)}]"
 
